@@ -11,41 +11,64 @@ const path = require('path');
 const app = express();
 
 // ================== VERIFICAÇÃO DE AMBIENTE ==================
-if (!process.env.JWT_SECRET) {
-  console.error('❌ ERRO CRÍTICO: JWT_SECRET não definido no .env');
-  console.error('⚠️  Para segurança, o servidor não pode iniciar sem uma chave secreta segura.');
+if (!process.env.JWT_SECRET || process.env.JWT_SECRET.length < 32) {
+  console.error('❌ ERRO CRÍTICO: JWT_SECRET não definido ou muito curto (mínimo 32 caracteres)');
   process.exit(1);
 }
 
 // ================== CONFIGURAÇÕES DE SEGURANÇA ==================
-app.use(helmet());
+app.use(helmet({
+  contentSecurityPolicy: {
+    directives: {
+      defaultSrc: ["'self'"],
+      styleSrc: ["'self'", "'unsafe-inline'"],
+      scriptSrc: ["'self'"],
+      imgSrc: ["'self'", "data:", "https:"],
+    },
+  },
+  hsts: {
+    maxAge: 31536000,
+    includeSubDomains: true,
+    preload: true
+  }
+}));
+
 app.use(cors({
   origin: process.env.FRONTEND_URL || 'http://localhost:5173',
   credentials: true,
   methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
   allowedHeaders: ['Content-Type', 'Authorization']
 }));
+
 app.use(express.json({ limit: '10kb' }));
 
-// Rate limiting específico por rota
+// Rate limiting
 const authLimiter = rateLimit({
-  windowMs: 15 * 60 * 1000,
-  max: 5,
-  message: { success: false, error: 'Muitas tentativas de login. Tente novamente mais tarde.' },
-  skipSuccessfulRequests: true
+  windowMs: 15 * 60 * 1000, // 15 minutos
+  max: 5, // 5 tentativas
+  message: { success: false, error: 'Muitas tentativas. Tente novamente em 15 minutos.' },
+  standardHeaders: true,
+  legacyHeaders: false,
 });
 
 const apiLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
   max: 100,
-  message: { success: false, error: 'Limite de requisições excedido. Tente novamente mais tarde.' }
+  message: { success: false, error: 'Limite de requisições excedido. Tente novamente mais tarde.' },
+});
+
+const postLimiter = rateLimit({
+  windowMs: 60 * 1000, // 1 minuto
+  max: 5, // 5 posts por minuto
+  message: { success: false, error: 'Muitos posts em pouco tempo. Aguarde um minuto.' },
 });
 
 app.use('/api/auth/login', authLimiter);
 app.use('/api/auth/register', authLimiter);
+app.use('/api/posts', postLimiter);
 app.use('/api/', apiLimiter);
 
-// ================== HELPER DE SANITIZAÇÃO (XSS) ==================
+// ================== HELPER DE SANITIZAÇÃO ==================
 function sanitizeInput(text) {
   if (typeof text !== 'string') return '';
   return text
@@ -53,20 +76,24 @@ function sanitizeInput(text) {
     .replace(/</g, "&lt;")
     .replace(/>/g, "&gt;")
     .replace(/"/g, "&quot;")
-    .replace(/'/g, "&#039;");
+    .replace(/'/g, "&#039;")
+    .trim();
 }
 
 // ================== DATABASE ==================
 const dbPath = path.join(__dirname, 'talkpro.db');
 const db = new sqlite3.Database(dbPath, (err) => {
-  if (err) return console.error('❌ Erro ao conectar ao banco:', err.message);
-  console.log('✅ Conectado ao SQLite (talkpro.db)');
+  if (err) {
+    console.error('❌ Erro ao conectar ao banco:', err.message);
+    process.exit(1);
+  }
+  console.log('✅ Conectado ao SQLite');
   db.run('PRAGMA foreign_keys = ON');
   db.run('PRAGMA journal_mode = WAL');
   createTables();
 });
 
-// ================== PROMISE DBWRAPPER ==================
+// Promise wrapper
 ['run', 'get', 'all'].forEach(method => {
   db[method + 'Async'] = function (sql, params = []) {
     return new Promise((resolve, reject) => {
@@ -81,7 +108,6 @@ const db = new sqlite3.Database(dbPath, (err) => {
 // ================== CRIAÇÃO DE TABELAS ==================
 async function createTables() {
   try {
-    // Tabela de usuários
     await db.runAsync(`CREATE TABLE IF NOT EXISTS users (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       name TEXT NOT NULL,
@@ -93,7 +119,6 @@ async function createTables() {
       last_login DATETIME
     )`);
 
-    // Tabela de posts
     await db.runAsync(`CREATE TABLE IF NOT EXISTS posts (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       user_id INTEGER NOT NULL,
@@ -107,7 +132,6 @@ async function createTables() {
       FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
     )`);
 
-    // Tabela de comentários
     await db.runAsync(`CREATE TABLE IF NOT EXISTS comments (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       post_id INTEGER NOT NULL,
@@ -120,7 +144,6 @@ async function createTables() {
       FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
     )`);
 
-    // Tabela de likes
     await db.runAsync(`CREATE TABLE IF NOT EXISTS post_likes (
       user_id INTEGER NOT NULL,
       post_id INTEGER NOT NULL,
@@ -130,7 +153,6 @@ async function createTables() {
       FOREIGN KEY (post_id) REFERENCES posts(id) ON DELETE CASCADE
     )`);
 
-    // Tabela de reports (denúncias)
     await db.runAsync(`CREATE TABLE IF NOT EXISTS reports (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       post_id INTEGER NOT NULL,
@@ -145,7 +167,6 @@ async function createTables() {
       FOREIGN KEY (reporter_id) REFERENCES users(id) ON DELETE CASCADE
     )`);
 
-    // Tabela de logs de admin
     await db.runAsync(`CREATE TABLE IF NOT EXISTS admin_logs (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       admin_id INTEGER,
@@ -158,37 +179,38 @@ async function createTables() {
       FOREIGN KEY (admin_id) REFERENCES users(id) ON DELETE SET NULL
     )`);
 
-    // Criar índices para performance
+    // Índices
     await db.runAsync('CREATE INDEX IF NOT EXISTS idx_posts_user_id ON posts(user_id)');
     await db.runAsync('CREATE INDEX IF NOT EXISTS idx_posts_created_at ON posts(created_at)');
-    await db.runAsync('CREATE INDEX IF NOT EXISTS idx_posts_is_flagged ON posts(is_flagged)');
     await db.runAsync('CREATE INDEX IF NOT EXISTS idx_comments_post_id ON comments(post_id)');
-    await db.runAsync('CREATE INDEX IF NOT EXISTS idx_comments_created_at ON comments(created_at)');
     await db.runAsync('CREATE INDEX IF NOT EXISTS idx_post_likes_post_id ON post_likes(post_id)');
-    await db.runAsync('CREATE INDEX IF NOT EXISTS idx_reports_resolved ON reports(resolved)');
-    await db.runAsync('CREATE INDEX IF NOT EXISTS idx_reports_created_at ON reports(created_at)');
-    await db.runAsync('CREATE INDEX IF NOT EXISTS idx_admin_logs_created_at ON admin_logs(created_at)');
 
     await createDefaultAdmin();
   } catch (err) {
     console.error('❌ Erro ao criar tabelas:', err);
+    process.exit(1);
   }
 }
 
-// ================== USUÁRIO ADMIN PADRÃO ==================
+// ================== ADMIN PADRÃO ==================
 async function createDefaultAdmin() {
   const email = process.env.ADMIN_EMAIL;
   const password = process.env.ADMIN_PASSWORD;
 
+  if (!email || !password) {
+    console.warn('⚠️ ADMIN_EMAIL ou ADMIN_PASSWORD não definidos no .env');
+    return;
+  }
+
   try {
-    const exists = await db.getAsync('SELECT id FROM users WHERE email = ?', [email]);
+    const exists = await db.getAsync('SELECT id FROM users WHERE email = ?', [email.toLowerCase()]);
     if (!exists) {
       const hash = await bcrypt.hash(password, 12);
       await db.runAsync(
         'INSERT INTO users (name, email, password, is_admin) VALUES (?, ?, ?, ?)',
-        ['Administrador', email, hash, 1]
+        ['Administrador', email.toLowerCase(), hash, 1]
       );
-      console.log('👑 Usuário admin criado:', email);
+      console.log('👑 Admin criado:', email);
     }
   } catch (err) {
     console.error('❌ Erro ao criar admin:', err);
@@ -198,38 +220,45 @@ async function createDefaultAdmin() {
 // ================== HELPERS ==================
 function generateToken(user) {
   return jwt.sign(
-    { id: user.id, email: user.email, is_admin: user.is_admin },
+    {
+      id: user.id,
+      email: user.email,
+      is_admin: user.is_admin
+    },
     process.env.JWT_SECRET,
-    { expiresIn: '7d' }
+    { expiresIn: '24h' } // Reduzido para 24h por segurança
   );
 }
 
-// ================== MIDDLEWARE ==================
+// ================== MIDDLEWARES ==================
 function auth(req, res, next) {
   try {
     const header = req.headers.authorization;
     if (!header?.startsWith('Bearer ')) {
-      return res.status(401).json({ success: false, error: 'Token não fornecido' });
+      return res.status(401).json({ success: false, error: 'Acesso não autorizado' });
     }
+
     const token = header.split(' ')[1];
     const decoded = jwt.verify(token, process.env.JWT_SECRET);
+
     req.userId = decoded.id;
     req.userIsAdmin = decoded.is_admin;
     next();
   } catch (err) {
-    res.status(401).json({ success: false, error: 'Sessão inválida ou expirada. Faça login novamente.' });
+    if (err.name === 'TokenExpiredError') {
+      return res.status(401).json({ success: false, error: 'Sessão expirada. Faça login novamente.' });
+    }
+    res.status(401).json({ success: false, error: 'Acesso não autorizado' });
   }
 }
 
-// Middleware para verificar se é admin
 function requireAdmin(req, res, next) {
   if (!req.userIsAdmin) {
-    return res.status(403).json({ success: false, error: 'Acesso restrito a administradores' });
+    return res.status(403).json({ success: false, error: 'Acesso restrito' });
   }
   next();
 }
 
-// Helper para log de ações admin
 async function logAdminAction(adminId, adminName, action, targetType = null, targetId = null, details = null) {
   try {
     await db.runAsync(
@@ -245,40 +274,37 @@ async function logAdminAction(adminId, adminName, action, targetType = null, tar
 
 // Health check
 app.get('/api/health', (req, res) => {
-  res.json({
-    status: 'ok',
-    timestamp: new Date().toISOString(),
-    uptime: process.uptime()
-  });
+  res.json({ status: 'ok', timestamp: new Date().toISOString() });
 });
 
-// ================== AUTH ROUTES ==================
+// ================== AUTH ==================
 
-// Register
 app.post('/api/auth/register', async (req, res) => {
   try {
     const { name, email, password } = req.body;
 
-    if (!name || !email || !password) {
+    // Validações
+    if (!name?.trim() || !email?.trim() || !password) {
       return res.status(400).json({ success: false, error: 'Preencha todos os campos' });
     }
 
-    if (name.length < 2 || name.length > 50) {
-      return res.status(400).json({ success: false, error: 'Nome deve ter entre 2 e 50 caracteres' });
+    if (name.trim().length < 2 || name.trim().length > 50) {
+      return res.status(400).json({ success: false, error: 'Nome deve ter 2-50 caracteres' });
     }
 
     if (password.length < 6) {
-      return res.status(400).json({ success: false, error: 'A senha deve ter no mínimo 6 caracteres' });
+      return res.status(400).json({ success: false, error: 'Senha mínima de 6 caracteres' });
     }
 
+    const emailLower = email.toLowerCase().trim();
     const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
-    if (!emailRegex.test(email)) {
+    if (!emailRegex.test(emailLower)) {
       return res.status(400).json({ success: false, error: 'Email inválido' });
     }
 
-    const exists = await db.getAsync('SELECT id FROM users WHERE email = ?', [email.toLowerCase()]);
+    const exists = await db.getAsync('SELECT id FROM users WHERE email = ?', [emailLower]);
     if (exists) {
-      return res.status(409).json({ success: false, error: 'Este email já está em uso' });
+      return res.status(409).json({ success: false, error: 'Email já cadastrado' });
     }
 
     const hash = await bcrypt.hash(password, 12);
@@ -286,7 +312,7 @@ app.post('/api/auth/register', async (req, res) => {
 
     const result = await db.runAsync(
       'INSERT INTO users (name, email, password) VALUES (?, ?, ?)',
-      [cleanName, email.toLowerCase(), hash]
+      [cleanName, emailLower, hash]
     );
 
     const user = await db.getAsync(
@@ -298,7 +324,7 @@ app.post('/api/auth/register', async (req, res) => {
 
     res.status(201).json({
       success: true,
-      message: 'Conta criada com sucesso!',
+      message: 'Conta criada!',
       token,
       user
     });
@@ -308,23 +334,23 @@ app.post('/api/auth/register', async (req, res) => {
   }
 });
 
-// Login
 app.post('/api/auth/login', async (req, res) => {
   try {
     const { email, password } = req.body;
 
-    if (!email || !password) {
+    if (!email?.trim() || !password) {
       return res.status(400).json({ success: false, error: 'Informe email e senha' });
     }
 
-    const user = await db.getAsync('SELECT * FROM users WHERE email = ?', [email.toLowerCase()]);
+    const emailLower = email.toLowerCase().trim();
+    const user = await db.getAsync('SELECT * FROM users WHERE email = ?', [emailLower]);
 
     if (!user || !(await bcrypt.compare(password, user.password))) {
       return res.status(401).json({ success: false, error: 'Email ou senha incorretos' });
     }
 
     if (!user.is_active) {
-      return res.status(403).json({ success: false, error: 'Conta desativada. Entre em contato com o suporte.' });
+      return res.status(403).json({ success: false, error: 'Conta desativada' });
     }
 
     await db.runAsync('UPDATE users SET last_login = CURRENT_TIMESTAMP WHERE id = ?', [user.id]);
@@ -339,7 +365,7 @@ app.post('/api/auth/login', async (req, res) => {
 
     res.json({
       success: true,
-      message: 'Bem-vindo de volta!',
+      message: 'Login realizado!',
       token,
       user: safeUser
     });
@@ -349,7 +375,6 @@ app.post('/api/auth/login', async (req, res) => {
   }
 });
 
-// Get current user
 app.get('/api/auth/me', auth, async (req, res) => {
   try {
     const user = await db.getAsync(
@@ -364,17 +389,16 @@ app.get('/api/auth/me', auth, async (req, res) => {
     res.json({ success: true, user });
   } catch (err) {
     console.error('Erro ao buscar usuário:', err);
-    res.status(500).json({ success: false, error: 'Erro ao buscar dados do usuário' });
+    res.status(500).json({ success: false, error: 'Erro ao buscar dados' });
   }
 });
 
-// ================== POSTS ROUTES ==================
+// ================== POSTS ==================
 
-// Get all posts with comments (OTIMIZADO - uma query apenas)
 app.get('/api/posts', auth, async (req, res) => {
   try {
     const page = parseInt(req.query.page) || 1;
-    const limit = parseInt(req.query.limit) || 10;
+    const limit = Math.min(parseInt(req.query.limit) || 10, 50); // Máximo 50
     const offset = (page - 1) * limit;
 
     const posts = await db.allAsync(`
@@ -430,13 +454,12 @@ app.get('/api/posts', auth, async (req, res) => {
   }
 });
 
-// Create post
 app.post('/api/posts', auth, async (req, res) => {
   try {
     const { text, category = 'outros', anonymous = false } = req.body;
 
-    if (!text || typeof text !== 'string' || !text.trim()) {
-      return res.status(400).json({ success: false, error: 'O conteúdo do post não pode estar vazio' });
+    if (!text?.trim()) {
+      return res.status(400).json({ success: false, error: 'Post não pode estar vazio' });
     }
 
     if (text.length > 1000) {
@@ -448,7 +471,7 @@ app.post('/api/posts', auth, async (req, res) => {
 
     const user = await db.getAsync('SELECT name FROM users WHERE id = ?', [req.userId]);
 
-    const cleanText = sanitizeInput(text.trim());
+    const cleanText = sanitizeInput(text);
     const cleanCategory = sanitizeInput(finalCategory);
 
     const result = await db.runAsync(
@@ -464,19 +487,15 @@ app.post('/api/posts', auth, async (req, res) => {
     `, [result.id]);
 
     post.comments = [];
-
-    if (post.anonymous) {
-      post.user_name = null;
-    }
+    if (post.anonymous) post.user_name = null;
 
     res.status(201).json(post);
   } catch (err) {
     console.error('Erro ao criar post:', err);
-    res.status(500).json({ success: false, error: 'Erro ao criar publicação' });
+    res.status(500).json({ success: false, error: 'Erro ao criar post' });
   }
 });
 
-// Like/Unlike post
 app.post('/api/posts/:postId/like', auth, async (req, res) => {
   try {
     const { postId } = req.params;
@@ -507,12 +526,11 @@ app.post('/api/posts/:postId/like', auth, async (req, res) => {
       likes: updatedPost.likes
     });
   } catch (err) {
-    console.error('Erro ao curtir post:', err);
+    console.error('Erro ao curtir:', err);
     res.status(500).json({ success: false, error: 'Erro ao curtir post' });
   }
 });
 
-// Delete post
 app.delete('/api/posts/:postId', auth, async (req, res) => {
   try {
     const { postId } = req.params;
@@ -523,31 +541,30 @@ app.delete('/api/posts/:postId', auth, async (req, res) => {
     }
 
     if (post.user_id !== req.userId && !req.userIsAdmin) {
-      return res.status(403).json({ success: false, error: 'Sem permissão para excluir este post' });
+      return res.status(403).json({ success: false, error: 'Sem permissão' });
     }
 
     await db.runAsync('DELETE FROM posts WHERE id = ?', [postId]);
-    res.json({ success: true, message: 'Post excluído com sucesso' });
+    res.json({ success: true, message: 'Post excluído' });
   } catch (err) {
     console.error('Erro ao deletar post:', err);
     res.status(500).json({ success: false, error: 'Erro ao excluir post' });
   }
 });
 
-// ================== COMMENTS ROUTES ==================
+// ================== COMMENTS ==================
 
-// Create comment
 app.post('/api/posts/:postId/comment', auth, async (req, res) => {
   try {
     const { postId } = req.params;
     const { content } = req.body;
 
-    if (!content || typeof content !== 'string' || !content.trim()) {
+    if (!content?.trim()) {
       return res.status(400).json({ success: false, error: 'Comentário obrigatório' });
     }
 
     if (content.length > 500) {
-      return res.status(400).json({ success: false, error: 'Comentário muito longo (máx 500 caracteres)' });
+      return res.status(400).json({ success: false, error: 'Comentário muito longo (máx 500)' });
     }
 
     const post = await db.getAsync('SELECT id FROM posts WHERE id = ?', [postId]);
@@ -556,7 +573,7 @@ app.post('/api/posts/:postId/comment', auth, async (req, res) => {
     }
 
     const user = await db.getAsync('SELECT name FROM users WHERE id = ?', [req.userId]);
-    const cleanContent = sanitizeInput(content.trim());
+    const cleanContent = sanitizeInput(content);
 
     const result = await db.runAsync(
       'INSERT INTO comments (post_id, user_id, user_name, text) VALUES (?, ?, ?, ?)',
@@ -572,53 +589,14 @@ app.post('/api/posts/:postId/comment', auth, async (req, res) => {
 
     res.status(201).json({
       success: true,
-      message: 'Comentário criado com sucesso',
       comment
     });
   } catch (err) {
-    console.error('Erro ao criar comentário:', err);
-    res.status(500).json({ success: false, error: 'Erro ao criar comentário' });
+    console.error('Erro ao comentar:', err);
+    res.status(500).json({ success: false, error: 'Erro ao comentar' });
   }
 });
 
-// Get comments for a specific post (paginado)
-app.get('/api/posts/:postId/comments', auth, async (req, res) => {
-  try {
-    const { postId } = req.params;
-    const page = parseInt(req.query.page) || 1;
-    const limit = parseInt(req.query.limit) || 10;
-    const offset = (page - 1) * limit;
-
-    const comments = await db.allAsync(`
-      SELECT c.*, u.name as user_name
-      FROM comments c
-      LEFT JOIN users u ON c.user_id = u.id
-      WHERE c.post_id = ?
-      ORDER BY c.created_at ASC
-      LIMIT ? OFFSET ?
-    `, [postId, limit, offset]);
-
-    const { count } = await db.getAsync(
-      'SELECT COUNT(*) as count FROM comments WHERE post_id = ?',
-      [postId]
-    );
-
-    res.json({
-      comments,
-      pagination: {
-        page,
-        limit,
-        total: count,
-        totalPages: Math.ceil(count / limit)
-      }
-    });
-  } catch (err) {
-    console.error('Erro ao buscar comentários:', err);
-    res.status(500).json({ success: false, error: 'Erro ao carregar comentários' });
-  }
-});
-
-// Delete comment
 app.delete('/api/comments/:commentId', auth, async (req, res) => {
   try {
     const { commentId } = req.params;
@@ -629,11 +607,11 @@ app.delete('/api/comments/:commentId', auth, async (req, res) => {
     }
 
     if (comment.user_id !== req.userId && !req.userIsAdmin) {
-      return res.status(403).json({ success: false, error: 'Sem permissão para excluir este comentário' });
+      return res.status(403).json({ success: false, error: 'Sem permissão' });
     }
 
     await db.runAsync('DELETE FROM comments WHERE id = ?', [commentId]);
-    res.json({ success: true, message: 'Comentário excluído com sucesso' });
+    res.json({ success: true, message: 'Comentário excluído' });
   } catch (err) {
     console.error('Erro ao deletar comentário:', err);
     res.status(500).json({ success: false, error: 'Erro ao excluir comentário' });
@@ -642,7 +620,6 @@ app.delete('/api/comments/:commentId', auth, async (req, res) => {
 
 // ================== ADMIN ROUTES ==================
 
-// Get dashboard stats
 app.get('/api/admin/stats', auth, requireAdmin, async (req, res) => {
   try {
     const totalUsers = await db.getAsync('SELECT COUNT(*) as count FROM users');
@@ -665,16 +642,15 @@ app.get('/api/admin/stats', auth, requireAdmin, async (req, res) => {
       }
     });
   } catch (err) {
-    console.error('Erro ao buscar estatísticas:', err);
+    console.error('Erro nas estatísticas:', err);
     res.status(500).json({ success: false, error: 'Erro ao carregar estatísticas' });
   }
 });
 
-// List all users (admin only) - com paginação e busca
 app.get('/api/admin/users', auth, requireAdmin, async (req, res) => {
   try {
     const page = parseInt(req.query.page) || 1;
-    const limit = parseInt(req.query.limit) || 10;
+    const limit = Math.min(parseInt(req.query.limit) || 10, 100);
     const offset = (page - 1) * limit;
     const search = req.query.search || '';
 
@@ -689,7 +665,7 @@ app.get('/api/admin/users', auth, requireAdmin, async (req, res) => {
 
     if (search) {
       query += ' WHERE u.name LIKE ? OR u.email LIKE ?';
-      params.push(`%${search}%`, `%${search}%`);
+      params.push(`%${sanitizeInput(search)}%`, `%${sanitizeInput(search)}%`);
     }
 
     query += ' ORDER BY u.created_at DESC LIMIT ? OFFSET ?';
@@ -697,12 +673,11 @@ app.get('/api/admin/users', auth, requireAdmin, async (req, res) => {
 
     const users = await db.allAsync(query, params);
 
-    // Contar total para paginação
     let countQuery = 'SELECT COUNT(*) as count FROM users';
     let countParams = [];
     if (search) {
       countQuery += ' WHERE name LIKE ? OR email LIKE ?';
-      countParams.push(`%${search}%`, `%${search}%`);
+      countParams.push(`%${sanitizeInput(search)}%`, `%${sanitizeInput(search)}%`);
     }
     const { count } = await db.getAsync(countQuery, countParams);
 
@@ -722,31 +697,6 @@ app.get('/api/admin/users', auth, requireAdmin, async (req, res) => {
   }
 });
 
-// Get single user details
-app.get('/api/admin/users/:userId', auth, requireAdmin, async (req, res) => {
-  try {
-    const { userId } = req.params;
-
-    const user = await db.getAsync(`
-      SELECT u.*,
-        (SELECT COUNT(*) FROM posts WHERE user_id = u.id) as posts_count,
-        (SELECT COUNT(*) FROM comments WHERE user_id = u.id) as comments_count
-      FROM users u
-      WHERE u.id = ?
-    `, [userId]);
-
-    if (!user) {
-      return res.status(404).json({ success: false, error: 'Usuário não encontrado' });
-    }
-
-    res.json({ success: true, user });
-  } catch (err) {
-    console.error('Erro ao buscar usuário:', err);
-    res.status(500).json({ success: false, error: 'Erro ao carregar dados do usuário' });
-  }
-});
-
-// Update user (admin only)
 app.put('/api/admin/users/:userId', auth, requireAdmin, async (req, res) => {
   try {
     const { userId } = req.params;
@@ -766,21 +716,16 @@ app.put('/api/admin/users/:userId', auth, requireAdmin, async (req, res) => {
       [sanitizeInput(name), email.toLowerCase(), is_admin ? 1 : 0, is_active ? 1 : 0, userId]
     );
 
-    // Log da ação
     const admin = await db.getAsync('SELECT name FROM users WHERE id = ?', [req.userId]);
-    await logAdminAction(req.userId, admin.name, 'UPDATE_USER', 'user', parseInt(userId), { name, is_admin, is_active });
+    await logAdminAction(req.userId, admin.name, 'UPDATE_USER', 'user', parseInt(userId));
 
-    res.json({
-      success: true,
-      message: 'Usuário atualizado com sucesso'
-    });
+    res.json({ success: true, message: 'Usuário atualizado' });
   } catch (err) {
     console.error('Erro ao atualizar usuário:', err);
-    res.status(500).json({ success: false, error: 'Erro ao atualizar usuário' });
+    res.status(500).json({ success: false, error: 'Erro ao atualizar' });
   }
 });
 
-// Delete user (admin only)
 app.delete('/api/admin/users/:userId', auth, requireAdmin, async (req, res) => {
   try {
     const { userId } = req.params;
@@ -796,54 +741,20 @@ app.delete('/api/admin/users/:userId', auth, requireAdmin, async (req, res) => {
 
     await db.runAsync('DELETE FROM users WHERE id = ?', [userId]);
 
-    // Log da ação
     const admin = await db.getAsync('SELECT name FROM users WHERE id = ?', [req.userId]);
-    await logAdminAction(req.userId, admin.name, 'DELETE_USER', 'user', parseInt(userId), { deletedUser: user.name });
+    await logAdminAction(req.userId, admin.name, 'DELETE_USER', 'user', parseInt(userId));
 
-    res.json({ success: true, message: 'Usuário excluído com sucesso' });
+    res.json({ success: true, message: 'Usuário excluído' });
   } catch (err) {
     console.error('Erro ao excluir usuário:', err);
-    res.status(500).json({ success: false, error: 'Erro ao excluir usuário' });
+    res.status(500).json({ success: false, error: 'Erro ao excluir' });
   }
 });
 
-// Toggle user active status (admin only)
-app.put('/api/admin/users/:userId/toggle', auth, requireAdmin, async (req, res) => {
-  try {
-    const { userId } = req.params;
-
-    if (parseInt(userId) === req.userId) {
-      return res.status(400).json({ success: false, error: 'Não pode desativar a si mesmo' });
-    }
-
-    const user = await db.getAsync('SELECT is_active, name FROM users WHERE id = ?', [userId]);
-    if (!user) {
-      return res.status(404).json({ success: false, error: 'Usuário não encontrado' });
-    }
-
-    const newStatus = user.is_active ? 0 : 1;
-    await db.runAsync('UPDATE users SET is_active = ? WHERE id = ?', [newStatus, userId]);
-
-    // Log da ação
-    const admin = await db.getAsync('SELECT name FROM users WHERE id = ?', [req.userId]);
-    await logAdminAction(req.userId, admin.name, newStatus ? 'ACTIVATE_USER' : 'DEACTIVATE_USER', 'user', parseInt(userId));
-
-    res.json({
-      success: true,
-      message: `Usuário ${newStatus ? 'ativado' : 'desativado'} com sucesso`,
-      is_active: newStatus
-    });
-  } catch (err) {
-    console.error('Erro ao alterar status do usuário:', err);
-    res.status(500).json({ success: false, error: 'Erro ao alterar status' });
-  }
-});
-
-// List all posts (admin only) - com paginação e filtros
 app.get('/api/admin/posts', auth, requireAdmin, async (req, res) => {
   try {
     const page = parseInt(req.query.page) || 1;
-    const limit = parseInt(req.query.limit) || 10;
+    const limit = Math.min(parseInt(req.query.limit) || 10, 100);
     const offset = (page - 1) * limit;
     const flagged = req.query.flagged;
 
@@ -867,7 +778,6 @@ app.get('/api/admin/posts', auth, requireAdmin, async (req, res) => {
 
     const posts = await db.allAsync(query, params);
 
-    // Contar total
     let countQuery = 'SELECT COUNT(*) as count FROM posts';
     if (flagged === 'true') {
       countQuery += ' WHERE is_flagged = 1';
@@ -892,34 +802,28 @@ app.get('/api/admin/posts', auth, requireAdmin, async (req, res) => {
   }
 });
 
-// Flag/Unflag post (admin only)
 app.post('/api/admin/posts/:postId/flag', auth, requireAdmin, async (req, res) => {
   try {
     const { postId } = req.params;
     const { flag } = req.body;
 
-    const post = await db.getAsync('SELECT text FROM posts WHERE id = ?', [postId]);
+    const post = await db.getAsync('SELECT id FROM posts WHERE id = ?', [postId]);
     if (!post) {
       return res.status(404).json({ success: false, error: 'Post não encontrado' });
     }
 
     await db.runAsync('UPDATE posts SET is_flagged = ? WHERE id = ?', [flag ? 1 : 0, postId]);
 
-    // Log da ação
     const admin = await db.getAsync('SELECT name FROM users WHERE id = ?', [req.userId]);
     await logAdminAction(req.userId, admin.name, flag ? 'FLAG_POST' : 'UNFLAG_POST', 'post', parseInt(postId));
 
-    res.json({
-      success: true,
-      message: `Post ${flag ? 'marcado' : 'desmarcado'} com sucesso`
-    });
+    res.json({ success: true, message: `Post ${flag ? 'marcado' : 'desmarcado'}` });
   } catch (err) {
     console.error('Erro ao flagar post:', err);
     res.status(500).json({ success: false, error: 'Erro ao atualizar post' });
   }
 });
 
-// Delete post (admin only)
 app.delete('/api/admin/posts/:postId', auth, requireAdmin, async (req, res) => {
   try {
     const { postId } = req.params;
@@ -931,22 +835,20 @@ app.delete('/api/admin/posts/:postId', auth, requireAdmin, async (req, res) => {
 
     await db.runAsync('DELETE FROM posts WHERE id = ?', [postId]);
 
-    // Log da ação
     const admin = await db.getAsync('SELECT name FROM users WHERE id = ?', [req.userId]);
     await logAdminAction(req.userId, admin.name, 'DELETE_POST', 'post', parseInt(postId));
 
-    res.json({ success: true, message: 'Post excluído com sucesso' });
+    res.json({ success: true, message: 'Post excluído' });
   } catch (err) {
     console.error('Erro ao excluir post:', err);
     res.status(500).json({ success: false, error: 'Erro ao excluir post' });
   }
 });
 
-// List all reports (admin only)
 app.get('/api/admin/reports', auth, requireAdmin, async (req, res) => {
   try {
     const page = parseInt(req.query.page) || 1;
-    const limit = parseInt(req.query.limit) || 10;
+    const limit = Math.min(parseInt(req.query.limit) || 10, 50);
     const offset = (page - 1) * limit;
     const resolved = req.query.resolved === 'true';
 
@@ -980,13 +882,12 @@ app.get('/api/admin/reports', auth, requireAdmin, async (req, res) => {
   }
 });
 
-// Create report (qualquer usuário autenticado)
 app.post('/api/reports', auth, async (req, res) => {
   try {
     const { post_id, reason, description } = req.body;
 
     if (!post_id || !reason) {
-      return res.status(400).json({ success: false, error: 'Post e motivo são obrigatórios' });
+      return res.status(400).json({ success: false, error: 'Post e motivo obrigatórios' });
     }
 
     const post = await db.getAsync('SELECT id FROM posts WHERE id = ?', [post_id]);
@@ -1003,7 +904,7 @@ app.post('/api/reports', auth, async (req, res) => {
 
     res.status(201).json({
       success: true,
-      message: 'Report enviado com sucesso',
+      message: 'Report enviado',
       report_id: result.id
     });
   } catch (err) {
@@ -1012,7 +913,6 @@ app.post('/api/reports', auth, async (req, res) => {
   }
 });
 
-// Resolve report (admin only)
 app.post('/api/admin/reports/:reportId/resolve', auth, requireAdmin, async (req, res) => {
   try {
     const { reportId } = req.params;
@@ -1027,21 +927,19 @@ app.post('/api/admin/reports/:reportId/resolve', auth, requireAdmin, async (req,
       [reportId]
     );
 
-    // Log da ação
     const admin = await db.getAsync('SELECT name FROM users WHERE id = ?', [req.userId]);
     await logAdminAction(req.userId, admin.name, 'RESOLVE_REPORT', 'report', parseInt(reportId));
 
-    res.json({ success: true, message: 'Report resolvido com sucesso' });
+    res.json({ success: true, message: 'Report resolvido' });
   } catch (err) {
     console.error('Erro ao resolver report:', err);
-    res.status(500).json({ success: false, error: 'Erro ao resolver report' });
+    res.status(500).json({ success: false, error: 'Erro ao resolver' });
   }
 });
 
-// List admin logs
 app.get('/api/admin/logs', auth, requireAdmin, async (req, res) => {
   try {
-    const limit = parseInt(req.query.limit) || 50;
+    const limit = Math.min(parseInt(req.query.limit) || 50, 200);
 
     const logs = await db.allAsync(`
       SELECT * FROM admin_logs
@@ -1049,7 +947,6 @@ app.get('/api/admin/logs', auth, requireAdmin, async (req, res) => {
       LIMIT ?
     `, [limit]);
 
-    // Parse details JSON
     logs.forEach(log => {
       if (log.details) {
         try {
@@ -1069,16 +966,19 @@ app.get('/api/admin/logs', auth, requireAdmin, async (req, res) => {
 
 // ================== ERROR HANDLING ==================
 app.use((err, req, res, next) => {
-  console.error('Erro não tratado:', err);
+  console.error('Erro:', err);
+
+  // Não expor detalhes em produção
+  const message = process.env.NODE_ENV === 'production'
+    ? 'Erro interno do servidor'
+    : err.message;
+
   res.status(500).json({
     success: false,
-    error: process.env.NODE_ENV === 'production'
-      ? 'Erro interno do servidor'
-      : err.message
+    error: message
   });
 });
 
-// 404 handler
 app.use((req, res) => {
   res.status(404).json({ success: false, error: 'Rota não encontrada' });
 });
@@ -1086,27 +986,26 @@ app.use((req, res) => {
 // ================== SERVER ==================
 const PORT = process.env.PORT || 3000;
 const server = app.listen(PORT, () => {
-  console.log(`🚀 Server rodando na porta ${PORT}`);
+  console.log(`🚀 Server na porta ${PORT}`);
   console.log(`🔒 Ambiente: ${process.env.NODE_ENV || 'development'}`);
-  console.log(`📱 Frontend: ${process.env.FRONTEND_URL || 'http://localhost:5173'}`);
 });
 
 // Graceful shutdown
 process.on('SIGTERM', () => {
-  console.log('👋 SIGTERM recebido. Fechando servidor...');
+  console.log('👋 SIGTERM. Fechando...');
   server.close(() => {
     db.close(() => {
-      console.log('💾 Conexão com banco fechada');
+      console.log('💾 Banco fechado');
       process.exit(0);
     });
   });
 });
 
 process.on('SIGINT', () => {
-  console.log('👋 SIGINT recebido. Fechando servidor...');
+  console.log('👋 SIGINT. Fechando...');
   server.close(() => {
     db.close(() => {
-      console.log('💾 Conexão com banco fechada');
+      console.log('💾 Banco fechado');
       process.exit(0);
     });
   });
